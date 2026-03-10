@@ -1,0 +1,18 @@
+[Unit]
+Description=Roblox Discord Presence Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/roblox-bot
+ExecStart=/home/ubuntu/roblox-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+# Load .env variables directly into the service environment
+EnvironmentFile=/home/ubuntu/roblox-bot/.env
+
+[Install]
+WantedBy=multi-user.target
