@@ -792,6 +792,10 @@ async def on_ready():
     try:
         if GUILD_ID:
             guild_obj = discord.Object(id=GUILD_ID)
+            # Clear any leftover global commands
+            bot.tree.clear_commands(guild=None)
+            await bot.tree.sync()
+            # Sync to guild (instant)
             bot.tree.copy_global_to(guild=guild_obj)
             synced = await bot.tree.sync(guild=guild_obj)
             print(f"Synced {len(synced)} command(s) to guild {GUILD_ID}")
