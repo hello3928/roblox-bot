@@ -18,6 +18,7 @@ PING_MODE               = os.getenv("PING_MODE", "everyone")  # everyone | here 
 ROLE_ID                 = os.getenv("ROLE_ID", "")
 CHECK_INTERVAL          = int(os.getenv("CHECK_INTERVAL", 30))
 GUILD_ID                = int(os.getenv("GUILD_ID", 0))
+ROBLOX_API_KEY          = os.getenv("ROBLOX_API_KEY", "")
 
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 WATCHLIST_FILE = os.path.join(BASE_DIR, "watchlist.json")
@@ -131,6 +132,18 @@ def _rblx_post(url: str, payload: dict) -> dict | None:
         print(f"[rblx_post] HTTP {r.status_code} {url}")
     except Exception as e:
         print(f"[rblx_post] Error {url}: {e}")
+    return None
+
+def _rblx_get_opencloud(url: str) -> dict | None:
+    """GET with Open Cloud API key authentication."""
+    try:
+        headers = {**HEADERS, "x-api-key": ROBLOX_API_KEY}
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        print(f"[rblx_opencloud] HTTP {r.status_code} {url}")
+    except Exception as e:
+        print(f"[rblx_opencloud] Error {url}: {e}")
     return None
 
 async def roblox_get_presence(user_ids: list[int]) -> list[dict]:
@@ -531,15 +544,18 @@ async def check_group_shouts():
     loop = asyncio.get_event_loop()
 
     for group_id, group_name in list(groups.items()):
-        data = await loop.run_in_executor(None, _rblx_get, f"https://groups.roblox.com/v1/groups/{group_id}")
+        if not ROBLOX_API_KEY:
+            print("[shouts] ROBLOX_API_KEY not set — cannot fetch group announcements")
+            break
+
+        data = await loop.run_in_executor(
+            None, _rblx_get_opencloud,
+            f"https://apis.roblox.com/cloud/v2/groups/{group_id}/shout"
+        )
         if not data:
             continue
 
-        shout = data.get("shout")
-        if not shout:
-            continue
-
-        body = shout.get("body", "").strip()
+        body = data.get("content", "").strip()
         if not body:
             continue
 
@@ -553,18 +569,28 @@ async def check_group_shouts():
             if prev_body is None:
                 continue
 
-            poster      = shout.get("poster", {})
-            poster_name = poster.get("displayName") or poster.get("username") or "Unknown"
-            updated     = shout.get("updated", "")
+            # poster is "users/{userId}" — resolve to a username
+            poster_ref  = data.get("poster", "")
+            poster_name = "Unknown"
+            if poster_ref.startswith("users/"):
+                try:
+                    poster_uid  = int(poster_ref.split("/")[1])
+                    poster_info = await roblox_get_user(poster_uid)
+                    if poster_info:
+                        poster_name = poster_info.get("displayName") or poster_info.get("name") or "Unknown"
+                except Exception:
+                    pass
+
+            updated = data.get("updateTime", "")
             try:
-                dt   = datetime.fromisoformat(updated.replace("Z", "+00:00"))
-                unix = int(dt.timestamp())
+                dt       = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                unix     = int(dt.timestamp())
                 time_str = f"<t:{unix}:R>"
             except Exception:
-                time_str = updated
+                time_str = updated or "Unknown"
 
             embed = discord.Embed(
-                title=f"New shout in {group_name}!",
+                title=f"New announcement in {group_name}!",
                 url=f"https://www.roblox.com/groups/{group_id}",
                 description=body,
                 color=discord.Color.orange(),
@@ -744,11 +770,15 @@ async def cmd_watchgroup(ctx: commands.Context, group_id: str):
         name = data.get("name", f"Group {group_id}")
         groups[group_id] = name
         save_groups(groups)
-        # Seed the current shout so we don't fire on first check
-        shout = data.get("shout")
-        if shout and shout.get("body"):
-            last_shouts[group_id] = shout["body"].strip()
-            save_last_shouts(last_shouts)
+        # Seed the current announcement so we don't fire on first check
+        if ROBLOX_API_KEY:
+            shout_data = await loop.run_in_executor(
+                None, _rblx_get_opencloud,
+                f"https://apis.roblox.com/cloud/v2/groups/{group_id}/shout"
+            )
+            if shout_data and shout_data.get("content"):
+                last_shouts[group_id] = shout_data["content"].strip()
+                save_last_shouts(last_shouts)
         await ctx.send(f"Now watching shouts for **{name}** (ID: `{group_id}`)")
     except Exception as e:
         await ctx.send(f"Something went wrong: `{e}`")
