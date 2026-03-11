@@ -4,6 +4,7 @@ import aiohttp
 import asyncio
 import os
 import json
+import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -72,96 +73,58 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
     "Origin": "https://www.roblox.com",
     "Referer": "https://www.roblox.com/",
 }
 
-def make_session() -> aiohttp.ClientSession:
-    connector = aiohttp.TCPConnector(force_close=True, ssl=False)
-    return aiohttp.ClientSession(connector=connector, headers=HEADERS)
-
-async def roblox_get_presence(session: aiohttp.ClientSession, user_ids: list[int]) -> list[dict]:
-    """Fetch presence data for a list of Roblox user IDs."""
-    url = "https://presence.roblox.com/v1/presence/users"
+def _rblx_get(url: str) -> dict | None:
     try:
-        async with session.post(url, json={"userIds": user_ids}) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("userPresences", [])
-            print(f"[presence] HTTP {resp.status}")
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        print(f"[rblx_get] HTTP {r.status_code} {url}")
     except Exception as e:
-        print(f"[presence] Error: {e}")
-    return []
-
-
-async def roblox_get_user(session: aiohttp.ClientSession, user_id: int) -> dict | None:
-    """Fetch Roblox user profile by ID."""
-    url = f"https://users.roblox.com/v1/users/{user_id}"
-    try:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            print(f"[user] HTTP {resp.status}")
-    except Exception as e:
-        print(f"[user] Error: {e}")
+        print(f"[rblx_get] Error {url}: {e}")
     return None
 
-
-async def roblox_search_user(session: aiohttp.ClientSession, username: str) -> dict | None:
-    """Look up a Roblox user by username. Returns the first match or None."""
-    url = "https://users.roblox.com/v1/usernames/users"
+def _rblx_post(url: str, payload: dict) -> dict | None:
     try:
-        async with session.post(url, json={"usernames": [username], "excludeBannedUsers": False}) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data.get("data"):
-                    return data["data"][0]
-            print(f"[search] HTTP {resp.status}")
+        r = requests.post(url, json=payload, headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        print(f"[rblx_post] HTTP {r.status_code} {url}")
     except Exception as e:
-        print(f"[search] Error: {e}")
+        print(f"[rblx_post] Error {url}: {e}")
     return None
 
+async def roblox_get_presence(user_ids: list[int]) -> list[dict]:
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _rblx_post, "https://presence.roblox.com/v1/presence/users", {"userIds": user_ids})
+    return data.get("userPresences", []) if data else []
 
-async def roblox_get_avatar_url(session: aiohttp.ClientSession, user_id: int) -> str | None:
-    """Fetch a headshot thumbnail URL for a user."""
-    url = (
-        f"https://thumbnails.roblox.com/v1/users/avatar-headshot"
-        f"?userIds={user_id}&size=420x420&format=Png"
-    )
-    try:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data.get("data"):
-                    return data["data"][0].get("imageUrl")
-    except Exception as e:
-        print(f"[avatar] Error: {e}")
+async def roblox_get_user(user_id: int) -> dict | None:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _rblx_get, f"https://users.roblox.com/v1/users/{user_id}")
+
+async def roblox_search_user(username: str) -> dict | None:
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _rblx_post, "https://users.roblox.com/v1/usernames/users", {"usernames": [username], "excludeBannedUsers": False})
+    if data and data.get("data"):
+        return data["data"][0]
+    return None
+
+async def roblox_get_avatar_url(user_id: int) -> str | None:
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _rblx_get, f"https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={user_id}&size=420x420&format=Png")
+    if data and data.get("data"):
+        return data["data"][0].get("imageUrl")
     return None
 
 # ─── RoPro API helper ─────────────────────────────────────────────────────────
 
-async def ropro_get_user_info(session: aiohttp.ClientSession, user_id: int) -> dict | None:
-    """
-    Fetch RoPro extended user info.
-    Endpoint: https://api.ropro.io/getUserInfoTest.php?userid=<id>
-
-    Known response fields (may vary — check ropro.io if the structure changes):
-      - linked          : bool   — whether the user has RoPro linked
-      - tier            : str    — subscription tier (e.g. "Free", "Pro")
-      - banStatus       : str    — any RoPro ban status
-      - rap             : int    — recent average price of inventory
-      - value           : int    — inventory value
-      - joins_disabled  : bool   — whether user has game joins disabled (RoPro-tracked)
-    """
-    url = f"https://api.ropro.io/getUserInfoTest.php?userid={user_id}"
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status == 200:
-                return await resp.json(content_type=None)
-    except Exception as e:
-        print(f"[ropro] Error fetching info for {user_id}: {e}")
-    return None
+async def ropro_get_user_info(user_id: int) -> dict | None:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _rblx_get, f"https://api.ropro.io/getUserInfoTest.php?userid={user_id}")
 
 # ─── Auto-delete helper ───────────────────────────────────────────────────────
 
@@ -186,10 +149,7 @@ def build_mention() -> str:
     return ""
 
 
-async def build_online_embed(
-    session: aiohttp.ClientSession,
-    presence: dict,
-) -> discord.Embed:
+async def build_online_embed(presence: dict) -> discord.Embed:
     user_id       = presence["userId"]
     ptype         = presence.get("userPresenceType", 0)
     root_place    = presence.get("rootPlaceId")
@@ -201,9 +161,9 @@ async def build_online_embed(
 
     # Parallel fetch of extra data
     user_info, thumbnail_url, ropro_info = await asyncio.gather(
-        roblox_get_user(session, user_id),
-        roblox_get_avatar_url(session, user_id),
-        ropro_get_user_info(session, user_id),
+        roblox_get_user(user_id),
+        roblox_get_avatar_url(user_id),
+        ropro_get_user_info(user_id),
     )
 
     username     = user_info.get("name",        f"User {user_id}") if user_info else f"User {user_id}"
@@ -287,15 +247,12 @@ async def build_online_embed(
     embed.set_footer(text=f"Roblox ID: {user_id}  •  checks every {CHECK_INTERVAL}s")
     return embed
 
-async def build_offline_embed(
-    session: aiohttp.ClientSession,
-    user_id: int,
-) -> discord.Embed:
+async def build_offline_embed(user_id: int) -> discord.Embed:
     went_offline_ts = int(datetime.now(timezone.utc).timestamp())
 
     user_info, thumbnail_url = await asyncio.gather(
-        roblox_get_user(session, user_id),
-        roblox_get_avatar_url(session, user_id),
+        roblox_get_user(user_id),
+        roblox_get_avatar_url(user_id),
     )
 
     username     = user_info.get("name",        f"User {user_id}") if user_info else f"User {user_id}"
@@ -339,39 +296,37 @@ async def check_presence():
 
     user_ids = [int(uid) for uid in watchlist]
 
-    async with make_session() as session:
-        presences = await roblox_get_presence(session, user_ids)
+    presences = await roblox_get_presence(user_ids)
 
-        for presence in presences:
-            user_id  = presence.get("userId")
-            if user_id is None:
-                continue
-            ptype    = presence.get("userPresenceType", 0)
-            prev     = previous_states.get(user_id, 0)
+    for presence in presences:
+        user_id  = presence.get("userId")
+        if user_id is None:
+            continue
+        ptype    = presence.get("userPresenceType", 0)
+        prev     = previous_states.get(user_id, 0)
 
-            # offline → online
-            if prev == 0 and ptype != 0:
-                try:
-                    embed   = await build_online_embed(session, presence)
-                    mention = build_mention()
-                    msg = await channel.send(mention, embed=embed)
-                    asyncio.create_task(delete_after(msg))
-                except Exception as e:
-                    print(f"[loop] Failed to send online notification for {user_id}: {e}")
+        # offline → online
+        if prev == 0 and ptype != 0:
+            try:
+                embed   = await build_online_embed(presence)
+                mention = build_mention()
+                msg = await channel.send(mention, embed=embed)
+                asyncio.create_task(delete_after(msg))
+            except Exception as e:
+                print(f"[loop] Failed to send online notification for {user_id}: {e}")
 
-            # online → offline
-            if prev != 0 and ptype == 0:
-                try:
-                    embed = await build_offline_embed(session, user_id)
-                    msg   = await channel.send(embed=embed)
-                    asyncio.create_task(delete_after(msg))
-                except Exception as e:
-                    print(f"[loop] Failed to send offline notification for {user_id}: {e}")
-                # Record last seen AFTER sending the offline embed
-                last_seen[str(user_id)] = datetime.now(timezone.utc).isoformat()
-                save_last_seen(last_seen)
+        # online → offline
+        if prev != 0 and ptype == 0:
+            try:
+                embed = await build_offline_embed(user_id)
+                msg   = await channel.send(embed=embed)
+                asyncio.create_task(delete_after(msg))
+            except Exception as e:
+                print(f"[loop] Failed to send offline notification for {user_id}: {e}")
+            last_seen[str(user_id)] = datetime.now(timezone.utc).isoformat()
+            save_last_seen(last_seen)
 
-            previous_states[user_id] = ptype
+        previous_states[user_id] = ptype
 
 
 @check_presence.before_loop
@@ -385,8 +340,7 @@ async def before_check():
 async def cmd_watch(ctx: commands.Context, username: str):
     await ctx.defer()
     try:
-        async with make_session() as session:
-            user = await roblox_search_user(session, username)
+        user = await roblox_search_user(username)
         if not user:
             await ctx.send(f"Could not find Roblox user **{username}**.")
             return
@@ -444,13 +398,12 @@ async def cmd_status(ctx: commands.Context, username: str):
         await ctx.send(f"**{username}** is not in the watchlist. Use `/watch` first.")
         return
 
-    async with make_session() as session:
-        presences = await roblox_get_presence(session, [uid])
-        if not presences:
-            await ctx.send("Failed to fetch presence data. Try again in a moment.")
-            return
+    presences = await roblox_get_presence([uid])
+    if not presences:
+        await ctx.send("Failed to fetch presence data. Try again in a moment.")
+        return
 
-        embed = await build_online_embed(session, presences[0]) if presences[0].get("userPresenceType", 0) != 0 else None
+    embed = await build_online_embed(presences[0]) if presences[0].get("userPresenceType", 0) != 0 else None
 
     if embed:
         await ctx.send(embed=embed)
