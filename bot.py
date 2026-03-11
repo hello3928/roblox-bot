@@ -64,6 +64,36 @@ def save_last_seen(data: dict):
 
 last_seen: dict = load_last_seen()  # { str(user_id): ISO timestamp }
 
+# ─── Group shout persistence ──────────────────────────────────────────────────
+
+GROUPS_FILE      = os.path.join(BASE_DIR, "groups.json")
+LAST_SHOUT_FILE  = os.path.join(BASE_DIR, "last_shouts.json")
+
+def load_groups() -> dict:
+    if os.path.exists(GROUPS_FILE):
+        with open(GROUPS_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_groups(data: dict):
+    with open(GROUPS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def load_last_shouts() -> dict:
+    if os.path.exists(LAST_SHOUT_FILE):
+        with open(LAST_SHOUT_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_last_shouts(data: dict):
+    with open(LAST_SHOUT_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+# groups format: { "group_id": "group_name" }
+groups: dict     = load_groups()
+# last_shouts: { "group_id": "shout_body" } — tracks last known shout to detect changes
+last_shouts: dict = load_last_shouts()
+
 # ─── Bot setup ───────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
@@ -115,17 +145,14 @@ async def roblox_search_user(username: str) -> dict | None:
         return data["data"][0]
     return None
 
-async def roblox_get_game_name(place_id: int) -> str:
-    """Resolve a place ID to a human-readable game name."""
+async def roblox_get_game_name(universe_id: int | None = None, place_id: int | None = None) -> str:
+    """Resolve a universe ID or place ID to a human-readable game name."""
     loop = asyncio.get_event_loop()
-    # Step 1: place → universe
-    uni_data = await loop.run_in_executor(None, _rblx_get, f"https://apis.roblox.com/universes/v1/places/{place_id}/universe")
-    if not uni_data:
-        return "Unknown Game"
-    universe_id = uni_data.get("universeId")
+    if not universe_id and place_id:
+        uni_data = await loop.run_in_executor(None, _rblx_get, f"https://apis.roblox.com/universes/v1/places/{place_id}/universe")
+        universe_id = uni_data.get("universeId") if uni_data else None
     if not universe_id:
         return "Unknown Game"
-    # Step 2: universe → game name
     game_data = await loop.run_in_executor(None, _rblx_get, f"https://games.roblox.com/v1/games?universeIds={universe_id}")
     if game_data and game_data.get("data"):
         return game_data["data"][0].get("name", "Unknown Game")
@@ -174,23 +201,26 @@ def build_mention() -> str:
 
 
 async def build_online_embed(presence: dict) -> discord.Embed:
-    user_id       = presence["userId"]
-    ptype         = presence.get("userPresenceType", 0)
-    root_place    = presence.get("rootPlaceId")
-    game_id       = presence.get("gameId")       # None when joins are off
-    root_place_for_name = presence.get("rootPlaceId") or presence.get("placeId")
-    last_online   = last_seen.get(str(user_id))  # tracked by the bot itself
+    user_id     = presence["userId"]
+    ptype       = presence.get("userPresenceType", 0)
+    root_place  = presence.get("rootPlaceId")
+    game_id     = presence.get("gameId")
+    universe_id = presence.get("universeId")
+    place_id    = presence.get("placeId")
+    last_online = last_seen.get(str(user_id))
+
+    print(f"[presence] user={user_id} type={ptype} universe={universe_id} place={place_id} root={root_place} game={game_id}")
 
     label, color = PRESENCE_TYPES.get(ptype, ("Online", discord.Color.green()))
 
-    # Parallel fetch of extra data
+    in_game = ptype == 2 and (universe_id or root_place or place_id)
     user_info, thumbnail_url, ropro_info, game_name = await asyncio.gather(
         roblox_get_user(user_id),
         roblox_get_avatar_url(user_id),
         ropro_get_user_info(user_id),
-        roblox_get_game_name(root_place_for_name) if ptype == 2 and root_place_for_name else asyncio.sleep(0),
+        roblox_get_game_name(universe_id=universe_id, place_id=root_place or place_id) if in_game else asyncio.sleep(0),
     )
-    if ptype != 2 or not root_place_for_name:
+    if not in_game:
         game_name = None
 
     username     = user_info.get("name",        f"User {user_id}") if user_info else f"User {user_id}"
@@ -275,16 +305,17 @@ async def build_online_embed(presence: dict) -> discord.Embed:
     return embed
 
 async def build_game_join_embed(presence: dict) -> discord.Embed:
-    user_id    = presence["userId"]
-    root_place = presence.get("rootPlaceId") or presence.get("placeId")
-    game_id    = presence.get("gameId")
+    user_id     = presence["userId"]
+    root_place  = presence.get("rootPlaceId") or presence.get("placeId")
+    game_id     = presence.get("gameId")
+    universe_id = presence.get("universeId")
 
     user_info, thumbnail_url, game_name = await asyncio.gather(
         roblox_get_user(user_id),
         roblox_get_avatar_url(user_id),
-        roblox_get_game_name(root_place) if root_place else asyncio.sleep(0),
+        roblox_get_game_name(universe_id=universe_id, place_id=root_place) if (universe_id or root_place) else asyncio.sleep(0),
     )
-    if not root_place:
+    if not universe_id and not root_place:
         game_name = "Unknown Game"
 
     username     = user_info.get("name",        f"User {user_id}") if user_info else f"User {user_id}"
@@ -435,6 +466,70 @@ async def check_presence():
 async def before_check():
     await bot.wait_until_ready()
 
+# ─── Group shout polling ──────────────────────────────────────────────────────
+
+@tasks.loop(seconds=60)
+async def check_group_shouts():
+    if not groups:
+        return
+
+    channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    loop = asyncio.get_event_loop()
+
+    for group_id, group_name in list(groups.items()):
+        data = await loop.run_in_executor(None, _rblx_get, f"https://groups.roblox.com/v1/groups/{group_id}")
+        if not data:
+            continue
+
+        shout = data.get("shout")
+        if not shout:
+            continue
+
+        body = shout.get("body", "").strip()
+        if not body:
+            continue
+
+        prev_body = last_shouts.get(group_id)
+
+        if body != prev_body:
+            last_shouts[group_id] = body
+            save_last_shouts(last_shouts)
+
+            # Don't notify on first run (just seed the stored shout)
+            if prev_body is None:
+                continue
+
+            poster      = shout.get("poster", {})
+            poster_name = poster.get("displayName") or poster.get("username") or "Unknown"
+            updated     = shout.get("updated", "")
+            try:
+                dt   = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                unix = int(dt.timestamp())
+                time_str = f"<t:{unix}:R>"
+            except Exception:
+                time_str = updated
+
+            embed = discord.Embed(
+                title=f"New shout in {group_name}!",
+                url=f"https://www.roblox.com/groups/{group_id}",
+                description=body,
+                color=discord.Color.orange(),
+            )
+            embed.add_field(name="Posted by", value=poster_name, inline=True)
+            embed.add_field(name="When",      value=time_str,    inline=True)
+            embed.set_footer(text=f"Group ID: {group_id}")
+
+            mention = build_mention()
+            msg = await channel.send(mention, embed=embed)
+            schedule_delete(msg)
+
+@check_group_shouts.before_loop
+async def before_shout_check():
+    await bot.wait_until_ready()
+
 # ─── Slash / prefix commands ──────────────────────────────────────────────────
 
 @bot.hybrid_command(name="watch", description="Add a Roblox user to the watchlist")
@@ -514,6 +609,59 @@ async def cmd_status(ctx: commands.Context, username: str):
         e = discord.Embed(title=f"{username} is {label}", color=color)
         await ctx.send(embed=e)
 
+@bot.hybrid_command(name="watchgroup", description="Add a Roblox group to watch for shouts")
+@commands.has_permissions(manage_guild=True)
+async def cmd_watchgroup(ctx: commands.Context, group_id: str):
+    await ctx.defer()
+    try:
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, _rblx_get, f"https://groups.roblox.com/v1/groups/{group_id}")
+        if not data or "id" not in data:
+            await ctx.send(f"Could not find group `{group_id}`. Check the ID and try again.")
+            return
+        name = data.get("name", f"Group {group_id}")
+        groups[group_id] = name
+        save_groups(groups)
+        # Seed the current shout so we don't fire on first check
+        shout = data.get("shout")
+        if shout and shout.get("body"):
+            last_shouts[group_id] = shout["body"].strip()
+            save_last_shouts(last_shouts)
+        await ctx.send(f"Now watching shouts for **{name}** (ID: `{group_id}`)")
+    except Exception as e:
+        await ctx.send(f"Something went wrong: `{e}`")
+
+
+@bot.hybrid_command(name="unwatchgroup", description="Stop watching a Roblox group for shouts")
+@commands.has_permissions(manage_guild=True)
+async def cmd_unwatchgroup(ctx: commands.Context, group_id: str):
+    try:
+        if group_id not in groups:
+            await ctx.send(f"Group `{group_id}` is not being watched.")
+            return
+        name = groups.pop(group_id)
+        save_groups(groups)
+        last_shouts.pop(group_id, None)
+        save_last_shouts(last_shouts)
+        await ctx.send(f"Stopped watching **{name}**.")
+    except Exception as e:
+        await ctx.send(f"Something went wrong: `{e}`")
+
+
+@bot.hybrid_command(name="groups", description="List all watched Roblox groups")
+async def cmd_groups(ctx: commands.Context):
+    if not groups:
+        await ctx.send("No groups being watched. Use `/watchgroup <group_id>` to add one.")
+        return
+    lines = [f"• **{name}** — ID: `{gid}`" for gid, name in groups.items()]
+    embed = discord.Embed(
+        title="Watched Groups",
+        description="\n".join(lines),
+        color=discord.Color.orange(),
+    )
+    await ctx.send(embed=embed)
+
+
 # ─── Bot events ───────────────────────────────────────────────────────────────
 
 @bot.event
@@ -525,6 +673,7 @@ async def on_ready():
     except Exception as e:
         print(f"Failed to sync slash commands: {e}")
     check_presence.start()
+    check_group_shouts.start()
 
 
 @bot.event
