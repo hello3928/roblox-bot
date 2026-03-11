@@ -788,11 +788,15 @@ async def cmd_groups(ctx: commands.Context):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}  (ID: {bot.user.id if bot.user else 'unknown'})")
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash command(s)")
-    except Exception as e:
-        print(f"Failed to sync slash commands: {e}")
+    total = 0
+    for guild in bot.guilds:
+        try:
+            synced = await bot.tree.sync(guild=guild)
+            total += len(synced)
+            print(f"Synced {len(synced)} command(s) to {guild.name}")
+        except Exception as e:
+            print(f"Failed to sync to {guild.name}: {e}")
+    print(f"Total synced: {total} command(s)")
     check_presence.start()
     check_group_shouts.start()
 
