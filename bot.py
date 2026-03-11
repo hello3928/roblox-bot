@@ -69,14 +69,23 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ─── Roblox API helpers ───────────────────────────────────────────────────────
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Origin": "https://www.roblox.com",
+    "Referer": "https://www.roblox.com/",
 }
+
+def make_session() -> aiohttp.ClientSession:
+    connector = aiohttp.TCPConnector(force_close=True, ssl=False)
+    return aiohttp.ClientSession(connector=connector, headers=HEADERS)
 
 async def roblox_get_presence(session: aiohttp.ClientSession, user_ids: list[int]) -> list[dict]:
     """Fetch presence data for a list of Roblox user IDs."""
     url = "https://presence.roblox.com/v1/presence/users"
     try:
-        async with session.post(url, json={"userIds": user_ids}, headers=HEADERS) as resp:
+        async with session.post(url, json={"userIds": user_ids}) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get("userPresences", [])
@@ -90,7 +99,7 @@ async def roblox_get_user(session: aiohttp.ClientSession, user_id: int) -> dict 
     """Fetch Roblox user profile by ID."""
     url = f"https://users.roblox.com/v1/users/{user_id}"
     try:
-        async with session.get(url, headers=HEADERS) as resp:
+        async with session.get(url) as resp:
             if resp.status == 200:
                 return await resp.json()
             print(f"[user] HTTP {resp.status}")
@@ -103,7 +112,7 @@ async def roblox_search_user(session: aiohttp.ClientSession, username: str) -> d
     """Look up a Roblox user by username. Returns the first match or None."""
     url = "https://users.roblox.com/v1/usernames/users"
     try:
-        async with session.post(url, json={"usernames": [username], "excludeBannedUsers": False}, headers=HEADERS) as resp:
+        async with session.post(url, json={"usernames": [username], "excludeBannedUsers": False}) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("data"):
@@ -121,7 +130,7 @@ async def roblox_get_avatar_url(session: aiohttp.ClientSession, user_id: int) ->
         f"?userIds={user_id}&size=420x420&format=Png"
     )
     try:
-        async with session.get(url, headers=HEADERS) as resp:
+        async with session.get(url) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("data"):
@@ -330,7 +339,7 @@ async def check_presence():
 
     user_ids = [int(uid) for uid in watchlist]
 
-    async with aiohttp.ClientSession() as session:
+    async with make_session() as session:
         presences = await roblox_get_presence(session, user_ids)
 
         for presence in presences:
@@ -376,7 +385,7 @@ async def before_check():
 async def cmd_watch(ctx: commands.Context, username: str):
     await ctx.defer()
     try:
-        async with aiohttp.ClientSession() as session:
+        async with make_session() as session:
             user = await roblox_search_user(session, username)
         if not user:
             await ctx.send(f"Could not find Roblox user **{username}**.")
@@ -435,7 +444,7 @@ async def cmd_status(ctx: commands.Context, username: str):
         await ctx.send(f"**{username}** is not in the watchlist. Use `/watch` first.")
         return
 
-    async with aiohttp.ClientSession() as session:
+    async with make_session() as session:
         presences = await roblox_get_presence(session, [uid])
         if not presences:
             await ctx.send("Failed to fetch presence data. Try again in a moment.")
