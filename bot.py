@@ -17,6 +17,7 @@ NOTIFICATION_CHANNEL_ID = int(os.getenv("NOTIFICATION_CHANNEL_ID", 0))
 PING_MODE               = os.getenv("PING_MODE", "everyone")  # everyone | here | role | none
 ROLE_ID                 = os.getenv("ROLE_ID", "")
 CHECK_INTERVAL          = int(os.getenv("CHECK_INTERVAL", 30))
+GUILD_ID                = int(os.getenv("GUILD_ID", 0))
 
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 WATCHLIST_FILE = os.path.join(BASE_DIR, "watchlist.json")
@@ -788,15 +789,16 @@ async def cmd_groups(ctx: commands.Context):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}  (ID: {bot.user.id if bot.user else 'unknown'})")
-    total = 0
-    for guild in bot.guilds:
-        try:
-            synced = await bot.tree.sync(guild=guild)
-            total += len(synced)
-            print(f"Synced {len(synced)} command(s) to {guild.name}")
-        except Exception as e:
-            print(f"Failed to sync to {guild.name}: {e}")
-    print(f"Total synced: {total} command(s)")
+    try:
+        if GUILD_ID:
+            guild_obj = discord.Object(id=GUILD_ID)
+            synced = await bot.tree.sync(guild=guild_obj)
+            print(f"Synced {len(synced)} command(s) to guild {GUILD_ID}")
+        else:
+            synced = await bot.tree.sync()
+            print(f"Synced {len(synced)} command(s) globally")
+    except Exception as e:
+        print(f"Failed to sync slash commands: {e}")
     check_presence.start()
     check_group_shouts.start()
 
