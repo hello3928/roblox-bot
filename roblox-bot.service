@@ -13,6 +13,7 @@ RestartSec=10
 
 # Load .env variables directly into the service environment
 EnvironmentFile=/home/ubuntu/roblox-bot/.env
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
