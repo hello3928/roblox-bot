@@ -18,7 +18,8 @@ PING_MODE              = os.getenv("PING_MODE", "everyone")  # everyone | here |
 ROLE_ID                = os.getenv("ROLE_ID", "")            # only used if PING_MODE=role
 CHECK_INTERVAL         = int(os.getenv("CHECK_INTERVAL", 30))
 
-WATCHLIST_FILE = "watchlist.json"
+BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
+WATCHLIST_FILE = os.path.join(BASE_DIR, "watchlist.json")
 
 # ─── Presence type labels & embed colors ─────────────────────────────────────
 
@@ -45,10 +46,11 @@ def save_watchlist(data: dict):
 watchlist: dict = load_watchlist()
 
 # Track last-known presence per user so we only notify on change
-previous_states: dict = {}  # { user_id (int): presence_type (int) }
+previous_states: dict   = {}  # { user_id (int): presence_type (int) }
+previous_game_ids: dict = {}  # { user_id (int): game_id (str|None) }
 
 # Track when each user was last seen online (persisted so restarts don't lose it)
-LAST_SEEN_FILE = "last_seen.json"
+LAST_SEEN_FILE = os.path.join(BASE_DIR, "last_seen.json")
 
 def load_last_seen() -> dict:
     if os.path.exists(LAST_SEEN_FILE):
@@ -113,6 +115,22 @@ async def roblox_search_user(username: str) -> dict | None:
         return data["data"][0]
     return None
 
+async def roblox_get_game_name(place_id: int) -> str:
+    """Resolve a place ID to a human-readable game name."""
+    loop = asyncio.get_event_loop()
+    # Step 1: place → universe
+    uni_data = await loop.run_in_executor(None, _rblx_get, f"https://apis.roblox.com/universes/v1/places/{place_id}/universe")
+    if not uni_data:
+        return "Unknown Game"
+    universe_id = uni_data.get("universeId")
+    if not universe_id:
+        return "Unknown Game"
+    # Step 2: universe → game name
+    game_data = await loop.run_in_executor(None, _rblx_get, f"https://games.roblox.com/v1/games?universeIds={universe_id}")
+    if game_data and game_data.get("data"):
+        return game_data["data"][0].get("name", "Unknown Game")
+    return "Unknown Game"
+
 async def roblox_get_avatar_url(user_id: int) -> str | None:
     loop = asyncio.get_event_loop()
     data = await loop.run_in_executor(None, _rblx_get, f"https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={user_id}&size=420x420&format=Png")
@@ -129,6 +147,7 @@ async def ropro_get_user_info(user_id: int) -> dict | None:
 # ─── Auto-delete helper ───────────────────────────────────────────────────────
 
 DELETE_AFTER = 300  # seconds (5 minutes)
+_delete_tasks: set = set()  # keeps task references alive until they complete
 
 async def delete_after(msg: discord.Message, delay: int = DELETE_AFTER):
     await asyncio.sleep(delay)
@@ -136,6 +155,11 @@ async def delete_after(msg: discord.Message, delay: int = DELETE_AFTER):
         await msg.delete()
     except (discord.NotFound, discord.Forbidden):
         pass
+
+def schedule_delete(msg: discord.Message):
+    task: asyncio.Task = asyncio.create_task(delete_after(msg))
+    _delete_tasks.add(task)
+    task.add_done_callback(_delete_tasks.discard)
 
 # ─── Build notification embed ─────────────────────────────────────────────────
 
@@ -154,17 +178,20 @@ async def build_online_embed(presence: dict) -> discord.Embed:
     ptype         = presence.get("userPresenceType", 0)
     root_place    = presence.get("rootPlaceId")
     game_id       = presence.get("gameId")       # None when joins are off
-    last_location = presence.get("lastLocation") or "Unknown Game"
+    root_place_for_name = presence.get("rootPlaceId") or presence.get("placeId")
     last_online   = last_seen.get(str(user_id))  # tracked by the bot itself
 
     label, color = PRESENCE_TYPES.get(ptype, ("Online", discord.Color.green()))
 
     # Parallel fetch of extra data
-    user_info, thumbnail_url, ropro_info = await asyncio.gather(
+    user_info, thumbnail_url, ropro_info, game_name = await asyncio.gather(
         roblox_get_user(user_id),
         roblox_get_avatar_url(user_id),
         ropro_get_user_info(user_id),
+        roblox_get_game_name(root_place_for_name) if ptype == 2 and root_place_for_name else asyncio.sleep(0),
     )
+    if ptype != 2 or not root_place_for_name:
+        game_name = None
 
     username     = user_info.get("name",        f"User {user_id}") if user_info else f"User {user_id}"
     display_name = user_info.get("displayName", username)          if user_info else username
@@ -190,7 +217,7 @@ async def build_online_embed(presence: dict) -> discord.Embed:
 
     # ── In-game fields ────────────────────────────────────────────────────────
     if ptype == 2:
-        embed.add_field(name="Playing", value=last_location, inline=False)
+        embed.add_field(name="Playing", value=game_name or "Unknown Game", inline=False)
 
         if root_place and game_id:
             # Joins are ON — deep link works
@@ -247,12 +274,55 @@ async def build_online_embed(presence: dict) -> discord.Embed:
     embed.set_footer(text=f"Roblox ID: {user_id}  •  checks every {CHECK_INTERVAL}s")
     return embed
 
+async def build_game_join_embed(presence: dict) -> discord.Embed:
+    user_id    = presence["userId"]
+    root_place = presence.get("rootPlaceId") or presence.get("placeId")
+    game_id    = presence.get("gameId")
+
+    user_info, thumbnail_url, game_name = await asyncio.gather(
+        roblox_get_user(user_id),
+        roblox_get_avatar_url(user_id),
+        roblox_get_game_name(root_place) if root_place else asyncio.sleep(0),
+    )
+    if not root_place:
+        game_name = "Unknown Game"
+
+    username     = user_info.get("name",        f"User {user_id}") if user_info else f"User {user_id}"
+    display_name = user_info.get("displayName", username)          if user_info else username
+
+    embed = discord.Embed(
+        title=f"{display_name} joined a game!",
+        url=f"https://www.roblox.com/users/{user_id}/profile",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Username", value=f"@{username}", inline=True)
+    embed.add_field(name="Playing",  value=game_name,      inline=True)
+
+    if root_place and game_id:
+        app_link = f"roblox://experiences/start?placeId={root_place}&gameInstanceId={game_id}"
+        web_link = f"https://www.roblox.com/games/{root_place}"
+        embed.add_field(
+            name="Join Game \u2705",
+            value=f"[Open in Roblox App]({app_link})\n[View on Web]({web_link})",
+            inline=False,
+        )
+    elif root_place:
+        web_link = f"https://www.roblox.com/games/{root_place}"
+        embed.add_field(name="Game (Joins Off \U0001f512)", value=f"[View on Web]({web_link})", inline=False)
+
+    if thumbnail_url:
+        embed.set_thumbnail(url=thumbnail_url)
+
+    embed.set_footer(text=f"Roblox ID: {user_id}  •  checks every {CHECK_INTERVAL}s")
+    return embed
+
 async def build_offline_embed(user_id: int) -> discord.Embed:
     went_offline_ts = int(datetime.now(timezone.utc).timestamp())
 
-    user_info, thumbnail_url = await asyncio.gather(
+    user_info, thumbnail_url, ropro_info = await asyncio.gather(
         roblox_get_user(user_id),
         roblox_get_avatar_url(user_id),
+        ropro_get_user_info(user_id),
     )
 
     username     = user_info.get("name",        f"User {user_id}") if user_info else f"User {user_id}"
@@ -266,15 +336,34 @@ async def build_offline_embed(user_id: int) -> discord.Embed:
     embed.add_field(name="Username",     value=f"@{username}",             inline=True)
     embed.add_field(name="Went Offline", value=f"<t:{went_offline_ts}:R>", inline=True)
 
-    # Last online before this session (from previous offline→online transition)
     prev_last_online = last_seen.get(str(user_id))
     if prev_last_online:
         try:
             dt   = datetime.fromisoformat(prev_last_online.replace("Z", "+00:00"))
             unix = int(dt.timestamp())
-            embed.add_field(name="Previously Online", value=f"<t:{unix}:R>", inline=True)
+            embed.add_field(name="Last Online", value=f"<t:{unix}:R>", inline=True)
         except Exception:
             pass
+
+    if ropro_info:
+        ropro_lines = []
+        tier = ropro_info.get("tier") or ropro_info.get("subscription")
+        if tier:
+            ropro_lines.append(f"**Tier:** {tier}")
+        rap = ropro_info.get("rap")
+        if rap is not None:
+            ropro_lines.append(f"**RAP:** {rap:,}")
+        value = ropro_info.get("value")
+        if value is not None:
+            ropro_lines.append(f"**Value:** {value:,}")
+        ban = ropro_info.get("banStatus") or ropro_info.get("ban_status")
+        if ban and ban.lower() not in ("none", "ok", ""):
+            ropro_lines.append(f"**Ban Status:** {ban}")
+        linked = ropro_info.get("linked")
+        if linked is not None:
+            ropro_lines.append(f"**RoPro Linked:** {'Yes' if linked else 'No'}")
+        if ropro_lines:
+            embed.add_field(name="RoPro Info", value="\n".join(ropro_lines), inline=False)
 
     if thumbnail_url:
         embed.set_thumbnail(url=thumbnail_url)
@@ -303,7 +392,9 @@ async def check_presence():
         if user_id is None:
             continue
         ptype    = presence.get("userPresenceType", 0)
+        game_id  = presence.get("gameId")
         prev     = previous_states.get(user_id, 0)
+        prev_gid = previous_game_ids.get(user_id)
 
         # offline → online
         if prev == 0 and ptype != 0:
@@ -311,22 +402,33 @@ async def check_presence():
                 embed   = await build_online_embed(presence)
                 mention = build_mention()
                 msg = await channel.send(mention, embed=embed)
-                asyncio.create_task(delete_after(msg))
+                schedule_delete(msg)
             except Exception as e:
                 print(f"[loop] Failed to send online notification for {user_id}: {e}")
+
+        # joined a game (or switched games) while already online
+        elif ptype == 2 and (prev != 2 or prev_gid != game_id):
+            try:
+                embed   = await build_game_join_embed(presence)
+                mention = build_mention()
+                msg = await channel.send(mention, embed=embed)
+                schedule_delete(msg)
+            except Exception as e:
+                print(f"[loop] Failed to send game-join notification for {user_id}: {e}")
 
         # online → offline
         if prev != 0 and ptype == 0:
             try:
                 embed = await build_offline_embed(user_id)
                 msg   = await channel.send(embed=embed)
-                asyncio.create_task(delete_after(msg))
+                schedule_delete(msg)
             except Exception as e:
                 print(f"[loop] Failed to send offline notification for {user_id}: {e}")
             last_seen[str(user_id)] = datetime.now(timezone.utc).isoformat()
             save_last_seen(last_seen)
 
-        previous_states[user_id] = ptype
+        previous_states[user_id]   = ptype
+        previous_game_ids[user_id] = game_id
 
 
 @check_presence.before_loop
