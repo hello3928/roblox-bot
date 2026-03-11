@@ -68,14 +68,19 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ─── Roblox API helpers ───────────────────────────────────────────────────────
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
 async def roblox_get_presence(session: aiohttp.ClientSession, user_ids: list[int]) -> list[dict]:
     """Fetch presence data for a list of Roblox user IDs."""
     url = "https://presence.roblox.com/v1/presence/users"
     try:
-        async with session.post(url, json={"userIds": user_ids}) as resp:
+        async with session.post(url, json={"userIds": user_ids}, headers=HEADERS) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get("userPresences", [])
+            print(f"[presence] HTTP {resp.status}")
     except Exception as e:
         print(f"[presence] Error: {e}")
     return []
@@ -85,9 +90,10 @@ async def roblox_get_user(session: aiohttp.ClientSession, user_id: int) -> dict 
     """Fetch Roblox user profile by ID."""
     url = f"https://users.roblox.com/v1/users/{user_id}"
     try:
-        async with session.get(url) as resp:
+        async with session.get(url, headers=HEADERS) as resp:
             if resp.status == 200:
                 return await resp.json()
+            print(f"[user] HTTP {resp.status}")
     except Exception as e:
         print(f"[user] Error: {e}")
     return None
@@ -97,11 +103,12 @@ async def roblox_search_user(session: aiohttp.ClientSession, username: str) -> d
     """Look up a Roblox user by username. Returns the first match or None."""
     url = "https://users.roblox.com/v1/usernames/users"
     try:
-        async with session.post(url, json={"usernames": [username], "excludeBannedUsers": False}) as resp:
+        async with session.post(url, json={"usernames": [username], "excludeBannedUsers": False}, headers=HEADERS) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("data"):
                     return data["data"][0]
+            print(f"[search] HTTP {resp.status}")
     except Exception as e:
         print(f"[search] Error: {e}")
     return None
@@ -114,7 +121,7 @@ async def roblox_get_avatar_url(session: aiohttp.ClientSession, user_id: int) ->
         f"?userIds={user_id}&size=420x420&format=Png"
     )
     try:
-        async with session.get(url) as resp:
+        async with session.get(url, headers=HEADERS) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("data"):
@@ -367,35 +374,38 @@ async def before_check():
 @bot.hybrid_command(name="watch", description="Add a Roblox user to the watchlist")
 @commands.has_permissions(manage_guild=True)
 async def cmd_watch(ctx: commands.Context, username: str):
-    """!watch <roblox_username>  |  /watch"""
     await ctx.defer()
-    async with aiohttp.ClientSession() as session:
-        user = await roblox_search_user(session, username)
-    if not user:
-        await ctx.send(f"Could not find Roblox user **{username}**. Check the spelling and try again.")
-        return
-
-    uid  = str(user["id"])
-    name = user["name"]
-    watchlist[uid] = name
-    save_watchlist(watchlist)
-    await ctx.send(f"Now watching **{name}** (ID: `{uid}`)")
+    try:
+        async with aiohttp.ClientSession() as session:
+            user = await roblox_search_user(session, username)
+        if not user:
+            await ctx.send(f"Could not find Roblox user **{username}**.")
+            return
+        uid  = str(user["id"])
+        name = user["name"]
+        watchlist[uid] = name
+        save_watchlist(watchlist)
+        await ctx.send(f"Now watching **{name}** (ID: `{uid}`)")
+    except Exception as e:
+        await ctx.send(f"Something went wrong: `{e}`")
 
 
 @bot.hybrid_command(name="unwatch", description="Remove a Roblox user from the watchlist")
 @commands.has_permissions(manage_guild=True)
 async def cmd_unwatch(ctx: commands.Context, username: str):
-    """!unwatch <roblox_username>  |  /unwatch"""
-    target = next(
-        (uid for uid, name in watchlist.items() if name.lower() == username.lower()),
-        None,
-    )
-    if target is None:
-        await ctx.send(f"**{username}** is not in the watchlist.")
-        return
-    removed = watchlist.pop(target)
-    save_watchlist(watchlist)
-    await ctx.send(f"Stopped watching **{removed}**.")
+    try:
+        target = next(
+            (uid for uid, name in watchlist.items() if name.lower() == username.lower()),
+            None,
+        )
+        if target is None:
+            await ctx.send(f"**{username}** is not in the watchlist.")
+            return
+        removed = watchlist.pop(target)
+        save_watchlist(watchlist)
+        await ctx.send(f"Stopped watching **{removed}**.")
+    except Exception as e:
+        await ctx.send(f"Something went wrong: `{e}`")
 
 
 @bot.hybrid_command(name="watchlist", description="List all watched Roblox users")
