@@ -12,11 +12,11 @@ load_dotenv()
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
-TOKEN                  = os.getenv("DISCORD_TOKEN")
+TOKEN                   = os.getenv("DISCORD_TOKEN")
 NOTIFICATION_CHANNEL_ID = int(os.getenv("NOTIFICATION_CHANNEL_ID", 0))
-PING_MODE              = os.getenv("PING_MODE", "everyone")  # everyone | here | role | none
-ROLE_ID                = os.getenv("ROLE_ID", "")            # only used if PING_MODE=role
-CHECK_INTERVAL         = int(os.getenv("CHECK_INTERVAL", 30))
+PING_MODE               = os.getenv("PING_MODE", "everyone")  # everyone | here | role | none
+ROLE_ID                 = os.getenv("ROLE_ID", "")
+CHECK_INTERVAL          = int(os.getenv("CHECK_INTERVAL", 30))
 
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 WATCHLIST_FILE = os.path.join(BASE_DIR, "watchlist.json")
@@ -48,6 +48,9 @@ watchlist: dict = load_watchlist()
 # Track last-known presence per user so we only notify on change
 previous_states: dict   = {}  # { user_id (int): presence_type (int) }
 previous_game_ids: dict = {}  # { user_id (int): game_id (str|None) }
+session_starts: dict    = {}  # { user_id (int): datetime } — when they came online
+offline_ticks: dict     = {}  # { user_id (int): int } — consecutive offline poll count
+OFFLINE_CONFIRM = 2           # how many consecutive offline polls before notifying
 
 # Track when each user was last seen online (persisted so restarts don't lose it)
 LAST_SEEN_FILE = os.path.join(BASE_DIR, "last_seen.json")
@@ -165,6 +168,29 @@ async def roblox_get_avatar_url(user_id: int) -> str | None:
         return data["data"][0].get("imageUrl")
     return None
 
+async def roblox_get_friend_count(user_id: int) -> int | None:
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _rblx_get, f"https://friends.roblox.com/v1/users/{user_id}/friends/count")
+    return data.get("count") if data else None
+
+async def roblox_get_follower_count(user_id: int) -> int | None:
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _rblx_get, f"https://friends.roblox.com/v1/users/{user_id}/followers/count")
+    return data.get("count") if data else None
+
+async def roblox_get_following_count(user_id: int) -> int | None:
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _rblx_get, f"https://friends.roblox.com/v1/users/{user_id}/followings/count")
+    return data.get("count") if data else None
+
+async def roblox_get_game_players(universe_id: int) -> int | None:
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _rblx_get, f"https://games.roblox.com/v1/games?universeIds={universe_id}")
+    if data and data.get("data"):
+        return data["data"][0].get("playing")
+    return None
+
+
 # ─── RoPro API helper ─────────────────────────────────────────────────────────
 
 async def ropro_get_user_info(user_id: int) -> dict | None:
@@ -189,6 +215,16 @@ def schedule_delete(msg: discord.Message):
     task.add_done_callback(_delete_tasks.discard)
 
 # ─── Build notification embed ─────────────────────────────────────────────────
+
+def format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    h, rem  = divmod(seconds, 3600)
+    m, s    = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 def build_mention() -> str:
     if PING_MODE == "everyone":
@@ -347,7 +383,7 @@ async def build_game_join_embed(presence: dict) -> discord.Embed:
     embed.set_footer(text=f"Roblox ID: {user_id}  •  checks every {CHECK_INTERVAL}s")
     return embed
 
-async def build_offline_embed(user_id: int) -> discord.Embed:
+async def build_offline_embed(user_id: int, session_duration: str | None = None) -> discord.Embed:
     went_offline_ts = int(datetime.now(timezone.utc).timestamp())
 
     user_info, thumbnail_url, ropro_info = await asyncio.gather(
@@ -366,6 +402,8 @@ async def build_offline_embed(user_id: int) -> discord.Embed:
     )
     embed.add_field(name="Username",     value=f"@{username}",             inline=True)
     embed.add_field(name="Went Offline", value=f"<t:{went_offline_ts}:R>", inline=True)
+    if session_duration:
+        embed.add_field(name="Session Duration", value=session_duration, inline=True)
 
     prev_last_online = last_seen.get(str(user_id))
     if prev_last_online:
@@ -427,8 +465,10 @@ async def check_presence():
         prev     = previous_states.get(user_id, 0)
         prev_gid = previous_game_ids.get(user_id)
 
-        # offline → online
+        # ── offline → online ──────────────────────────────────────────────────
         if prev == 0 and ptype != 0:
+            offline_ticks[user_id]  = 0
+            session_starts[user_id] = datetime.now(timezone.utc)
             try:
                 embed   = await build_online_embed(presence)
                 mention = build_mention()
@@ -437,8 +477,9 @@ async def check_presence():
             except Exception as e:
                 print(f"[loop] Failed to send online notification for {user_id}: {e}")
 
-        # joined a game (or switched games) while already online
+        # ── joined / switched game while already online ────────────────────────
         elif ptype == 2 and (prev != 2 or prev_gid != game_id):
+            offline_ticks[user_id] = 0
             try:
                 embed   = await build_game_join_embed(presence)
                 mention = build_mention()
@@ -447,16 +488,25 @@ async def check_presence():
             except Exception as e:
                 print(f"[loop] Failed to send game-join notification for {user_id}: {e}")
 
-        # online → offline
+        # ── online → offline (with anti-flicker debounce) ─────────────────────
         if prev != 0 and ptype == 0:
-            try:
-                embed = await build_offline_embed(user_id)
-                msg   = await channel.send(embed=embed)
-                schedule_delete(msg)
-            except Exception as e:
-                print(f"[loop] Failed to send offline notification for {user_id}: {e}")
-            last_seen[str(user_id)] = datetime.now(timezone.utc).isoformat()
-            save_last_seen(last_seen)
+            ticks = offline_ticks.get(user_id, 0) + 1
+            offline_ticks[user_id] = ticks
+            if ticks >= OFFLINE_CONFIRM:
+                # Calculate session duration
+                start    = session_starts.pop(user_id, None)
+                duration = format_duration((datetime.now(timezone.utc) - start).total_seconds()) if start else None
+                try:
+                    embed = await build_offline_embed(user_id, session_duration=duration)
+                    msg   = await channel.send(embed=embed)
+                    schedule_delete(msg)
+                except Exception as e:
+                    print(f"[loop] Failed to send offline notification for {user_id}: {e}")
+                last_seen[str(user_id)] = datetime.now(timezone.utc).isoformat()
+                save_last_seen(last_seen)
+                offline_ticks[user_id] = 0
+        else:
+            offline_ticks[user_id] = 0
 
         previous_states[user_id]   = ptype
         previous_game_ids[user_id] = game_id
@@ -529,6 +579,8 @@ async def check_group_shouts():
 @check_group_shouts.before_loop
 async def before_shout_check():
     await bot.wait_until_ready()
+
+STATUS_ICONS = {"none": "✅", "minor": "⚠️", "major": "🔴", "critical": "🚨"}
 
 # ─── Slash / prefix commands ──────────────────────────────────────────────────
 
@@ -608,6 +660,75 @@ async def cmd_status(ctx: commands.Context, username: str):
         label, color = PRESENCE_TYPES[0]
         e = discord.Embed(title=f"{username} is {label}", color=color)
         await ctx.send(embed=e)
+
+@bot.hybrid_command(name="profile", description="Show a Roblox user's full profile")
+async def cmd_profile(ctx: commands.Context, username: str):
+    await ctx.defer()
+    try:
+        user = await roblox_search_user(username)
+        if not user:
+            await ctx.send(f"Could not find **{username}**.")
+            return
+        uid = user["id"]
+
+        user_info, thumbnail_url, friends, followers, following, ropro_info = await asyncio.gather(
+            roblox_get_user(uid),
+            roblox_get_avatar_url(uid),
+            roblox_get_friend_count(uid),
+            roblox_get_follower_count(uid),
+            roblox_get_following_count(uid),
+            ropro_get_user_info(uid),
+        )
+        if not user_info:
+            await ctx.send("Could not fetch profile data.")
+            return
+
+        display  = user_info.get("displayName", user_info["name"])
+        name     = user_info["name"]
+        desc     = user_info.get("description", "").strip()
+        created  = user_info.get("created", "")
+        verified = user_info.get("hasVerifiedBadge", False)
+
+        embed = discord.Embed(
+            title=f"{display} (@{name})" + (" ✅" if verified else ""),
+            url=f"https://www.roblox.com/users/{uid}/profile",
+            description=desc or "*No description*",
+            color=discord.Color.blurple(),
+        )
+        if created:
+            try:
+                dt   = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                unix = int(dt.timestamp())
+                embed.add_field(name="Joined Roblox", value=f"<t:{unix}:D>", inline=True)
+            except Exception:
+                pass
+        if friends   is not None: embed.add_field(name="Friends",   value=f"{friends:,}",   inline=True)
+        if followers  is not None: embed.add_field(name="Followers", value=f"{followers:,}",  inline=True)
+        if following  is not None: embed.add_field(name="Following", value=f"{following:,}",  inline=True)
+
+        if ropro_info:
+            tier = ropro_info.get("tier") or ropro_info.get("subscription")
+            rap  = ropro_info.get("rap")
+            if tier: embed.add_field(name="RoPro Tier", value=tier, inline=True)
+            if rap is not None: embed.add_field(name="RAP", value=f"{rap:,}", inline=True)
+
+        embed.set_footer(text=f"User ID: {uid}")
+        if thumbnail_url:
+            embed.set_thumbnail(url=thumbnail_url)
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"Something went wrong: `{e}`")
+
+
+@bot.hybrid_command(name="rblxstatus", description="Check current Roblox platform status")
+async def cmd_rblxstatus(ctx: commands.Context):
+    embed = discord.Embed(
+        title="Roblox Platform Status",
+        description="Check live status at [status.roblox.com](https://status.roblox.com)",
+        color=discord.Color.blurple(),
+    )
+    await ctx.send(embed=embed)
+
 
 @bot.hybrid_command(name="watchgroup", description="Add a Roblox group to watch for shouts")
 @commands.has_permissions(manage_guild=True)
